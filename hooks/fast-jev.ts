@@ -300,11 +300,6 @@ type Runtime = {
   skippedAtPercent: number | null;
   /** Whether the "state dir not writable" line was already shown this session. */
   writeFailureNoted: boolean;
-  /**
-   * A cold compaction the engine rejected before the first turn (a session started with an
-   * initial prompt counts as headless until that turn runs): retried once after the turn.
-   */
-  coldPending: boolean;
 };
 
 type SessionUsageOf = { session: { usage: () => Promise<{ context: { percent?: number } }> } };
@@ -400,19 +395,19 @@ async function requestCompaction(
   $: CompactOf & EnvOf & FsOf,
   runtime: Runtime,
   why: CompactionOrigin,
-  retry = false,
-): Promise<void> {
-  if (runtime.compacting) return;
+): Promise<boolean> {
+  if (runtime.compacting) return false;
   runtime.compacting = true;
   runtime.origin = why;
   try {
     const outcome = await $.session.compact();
     await journal($, runtime, `session.compact() for ${why} resolved: ${JSON.stringify(outcome).slice(0, 300)}`);
+    return true;
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
     $.ui.log(`compaction skipped (${text})`);
     await journal($, runtime, `session.compact() for ${why} rejected: ${text}`);
-    if (why === 'cold' && !retry) runtime.coldPending = true;
+    return false;
   } finally {
     runtime.compacting = false;
     runtime.origin = null;
@@ -439,8 +434,10 @@ async function coldCheck(
   const line = `${when}: cache cold (${reason}), history ~${tokens} tokens: compacting`;
   $.ui.log(line);
   await journal($, runtime, line);
-  await requestCompaction($, runtime, 'cold');
-  await writeState($, runtime);
+  // A rejected compaction (the engine counts a session started with an initial prompt as
+  // headless until its first turn) leaves the state alone: the next check point still reads
+  // cold and tries again before the first model call, instead of paying the cache write.
+  if (await requestCompaction($, runtime, 'cold')) await writeState($, runtime);
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
@@ -450,7 +447,6 @@ export const register: Register = (on: On, options: PluginOptions) => {
     origin: null,
     skippedAtPercent: null,
     writeFailureNoted: false,
-    coldPending: false,
   };
 
   on('session.compact', async ($, event, next) => {
@@ -519,17 +515,6 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     await writeState($, runtime);
     if (runtime.compacting) return next(event);
-    if (runtime.coldPending) {
-      runtime.coldPending = false;
-      try {
-        await journal($, runtime, 'turn.complete: retrying the cold compaction rejected before the first turn');
-        await requestCompaction($, runtime, 'cold', true);
-        await writeState($, runtime);
-      } catch (error) {
-        $.ui.log(`cold retry skipped (${error instanceof Error ? error.message : String(error)})`);
-      }
-      return next(event);
-    }
     try {
       const percent = await contextPercent($);
       if (!thresholdDue(percent, runtime.config.compactAtPercent, runtime.skippedAtPercent)) return next(event);

@@ -3,10 +3,9 @@ import { register } from '../hooks/fast-jev.ts';
 
 type Handler = (dollar: unknown, event: unknown, next: (e: unknown) => unknown) => Promise<unknown>;
 
-/** A fake host: an in-memory fs, a compact() that rejects until told otherwise, a big history. */
+/** A fake host: an in-memory fs, a compact() that rejects the first N calls, a big history. */
 function host(compactRejectsFirst: number) {
   const files = new Map<string, string>();
-  const logs: string[] = [];
   let compactCalls = 0;
   const dollar = {
     env: { get: async (name: string) => ({ HOME: '/h', CLAUDE_CONFIG_DIR: '/h/.config/claude-a' })[name] },
@@ -30,9 +29,9 @@ function host(compactRejectsFirst: number) {
         return { ok: true };
       },
     },
-    ui: { log: (t: string) => void logs.push(t), toast: () => undefined },
+    ui: { log: () => undefined, toast: () => undefined },
   };
-  return { dollar, files, logs, compactCalls: () => compactCalls };
+  return { dollar, files, compactCalls: () => compactCalls };
 }
 
 function wire() {
@@ -43,45 +42,43 @@ function wire() {
     cacheTtlMinutes: 5,
   } as never);
   const next = (e: unknown) => e;
-  const fire = (name: string, dollar: unknown) => handlers.get(name)!(dollar, {}, next);
-  return { fire };
+  return { fire: (name: string, dollar: unknown) => handlers.get(name)!(dollar, {}, next) };
 }
 
-describe('cold compaction rejected before the first turn', () => {
-  it('is retried once after the first turn, then not again', async () => {
+const STATE = '/state/sess-1.json';
+
+describe('a cold compaction the engine rejects at session.start', () => {
+  it('leaves the state unwritten, so prompt.submit still reads cold and compacts before the model call', async () => {
     const h = host(1);
     const { fire } = wire();
     await fire('session.start', h.dollar);
     expect(h.compactCalls()).toBe(1);
-    const journal1 = h.files.get('/state/journal.log') ?? '';
-    expect(journal1).toContain('cache cold (no-state)');
-    expect(journal1).toContain('rejected');
+    expect(h.files.has(STATE)).toBe(false);
+    expect(h.files.get('/state/journal.log')).toContain('session.compact() for cold rejected');
 
-    await fire('turn.complete', h.dollar);
+    await fire('prompt.submit', h.dollar);
     expect(h.compactCalls()).toBe(2);
-    const journal2 = h.files.get('/state/journal.log') ?? '';
-    expect(journal2).toContain('retrying the cold compaction rejected before the first turn');
-    expect(journal2).toContain('session.compact() for cold resolved');
-
-    await fire('turn.complete', h.dollar);
-    expect(h.compactCalls()).toBe(2);
+    expect(h.files.has(STATE)).toBe(true);
+    expect(h.files.get('/state/journal.log')).toContain('prompt.submit: cache cold (no-state)');
   });
 
-  it('does not retry when the start-time compaction was accepted', async () => {
-    const h = host(0);
-    const { fire } = wire();
-    await fire('session.start', h.dollar);
-    expect(h.compactCalls()).toBe(1);
-    await fire('turn.complete', h.dollar);
-    expect(h.compactCalls()).toBe(1);
-  });
-
-  it('gives up after one retry when the session stays headless (claude -p)', async () => {
+  it('is not retried after a turn: the cache write has happened by then', async () => {
     const h = host(99);
     const { fire } = wire();
     await fire('session.start', h.dollar);
     await fire('turn.complete', h.dollar);
     await fire('turn.complete', h.dollar);
-    expect(h.compactCalls()).toBe(2);
+    expect(h.compactCalls()).toBe(1);
+    expect(h.files.has(STATE)).toBe(true); // turn.complete records the now-warm cache
+  });
+
+  it('writes the state once the start-time compaction is accepted', async () => {
+    const h = host(0);
+    const { fire } = wire();
+    await fire('session.start', h.dollar);
+    expect(h.compactCalls()).toBe(1);
+    expect(h.files.has(STATE)).toBe(true);
+    await fire('prompt.submit', h.dollar);
+    expect(h.compactCalls()).toBe(1);
   });
 });
