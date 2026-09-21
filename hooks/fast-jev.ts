@@ -330,7 +330,7 @@ async function historyTokens($: MessagesOf): Promise<number> {
 }
 
 /** A small journal beside the state files, since `$.ui.log` is invisible under `-p`. */
-async function journal($: EnvOf & FsOf, runtime: Runtime, line: string): Promise<void> {
+async function journal($: EnvOf & FsOf & UiLogOf, runtime: Runtime, line: string): Promise<void> {
   try {
     const dir = runtime.config.stateDir || `${(await $.env.get('HOME')) ?? '/tmp'}/.cache/fast-jev-compaction`;
     const path = `${dir.replace(/\/+$/, '')}/journal.log`;
@@ -352,11 +352,11 @@ async function journal($: EnvOf & FsOf, runtime: Runtime, line: string): Promise
 type UiLogOf = { ui: { log: (line: string) => void } };
 
 /** Says once per session that the state dir is not writable (otherwise every start reads "cold"). */
-function noteWriteFailure($: Partial<UiLogOf>, runtime: Runtime, what: string, error: unknown): void {
+function noteWriteFailure($: UiLogOf, runtime: Runtime, what: string, error: unknown): void {
   if (runtime.writeFailureNoted) return;
   runtime.writeFailureNoted = true;
   const text = error instanceof Error ? error.message : String(error);
-  $.ui?.log(`fast-jev-compaction: ${what} write failed (${text}); cold-start state will not persist`);
+  $.ui.log(`fast-jev-compaction: ${what} write failed (${text}); cold-start state will not persist`);
 }
 
 async function stateFile($: EnvOf & SessionIdOf, runtime: Runtime): Promise<string> {
@@ -381,7 +381,7 @@ async function readState($: EnvOf & SessionIdOf & FsOf, runtime: Runtime): Promi
   }
 }
 
-async function writeState($: EnvOf & SessionIdOf & FsOf, runtime: Runtime): Promise<void> {
+async function writeState($: EnvOf & SessionIdOf & FsOf & UiLogOf, runtime: Runtime): Promise<void> {
   try {
     await $.fs.write(await stateFile($, runtime), serializeState(await nowState($)));
   } catch (error) {
