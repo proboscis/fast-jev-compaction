@@ -300,6 +300,11 @@ type Runtime = {
   skippedAtPercent: number | null;
   /** Whether the "state dir not writable" line was already shown this session. */
   writeFailureNoted: boolean;
+  /**
+   * A cold compaction the engine rejected before the first turn (a session started with an
+   * initial prompt counts as headless until that turn runs): retried once after the turn.
+   */
+  coldPending: boolean;
 };
 
 type SessionUsageOf = { session: { usage: () => Promise<{ context: { percent?: number } }> } };
@@ -395,6 +400,7 @@ async function requestCompaction(
   $: CompactOf & EnvOf & FsOf,
   runtime: Runtime,
   why: CompactionOrigin,
+  retry = false,
 ): Promise<void> {
   if (runtime.compacting) return;
   runtime.compacting = true;
@@ -406,6 +412,7 @@ async function requestCompaction(
     const text = error instanceof Error ? error.message : String(error);
     $.ui.log(`compaction skipped (${text})`);
     await journal($, runtime, `session.compact() for ${why} rejected: ${text}`);
+    if (why === 'cold' && !retry) runtime.coldPending = true;
   } finally {
     runtime.compacting = false;
     runtime.origin = null;
@@ -443,6 +450,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
     origin: null,
     skippedAtPercent: null,
     writeFailureNoted: false,
+    coldPending: false,
   };
 
   on('session.compact', async ($, event, next) => {
@@ -511,6 +519,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     await writeState($, runtime);
     if (runtime.compacting) return next(event);
+    if (runtime.coldPending) {
+      runtime.coldPending = false;
+      try {
+        await journal($, runtime, 'turn.complete: retrying the cold compaction rejected before the first turn');
+        await requestCompaction($, runtime, 'cold', true);
+        await writeState($, runtime);
+      } catch (error) {
+        $.ui.log(`cold retry skipped (${error instanceof Error ? error.message : String(error)})`);
+      }
+      return next(event);
+    }
     try {
       const percent = await contextPercent($);
       if (!thresholdDue(percent, runtime.config.compactAtPercent, runtime.skippedAtPercent)) return next(event);
