@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -87,6 +87,11 @@
       "title": "Minimum history for a cold compaction",
       "description": "Below this many estimated history tokens a cache-cold compaction is not worth a Jev request.",
       "default": 20000
+    },
+    "apiKeyFile": {
+      "type": "string",
+      "title": "TypeSafe API key file",
+      "description": "Path of a file holding the TypeSafe API key (e.g. a mounted Kubernetes secret). Takes precedence over TYPESAFE_API_KEY."
     }
   }
 }

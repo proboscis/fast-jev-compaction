@@ -63,6 +63,8 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  /** A file holding the TypeSafe API key (a mounted secret); read at compaction time, never logged. */
+  apiKeyFile?: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -116,6 +118,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
+  const apiKeyFile = optionString(options, 'apiKeyFile');
+  if (apiKeyFile) config.apiKeyFile = apiKeyFile;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
@@ -262,10 +266,16 @@ async function getApiKey(
   $: {
     env: { get: (name: string) => Promise<string | undefined> };
     settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
+    fs: { read: (p: string) => Promise<string> };
   },
   config: HookConfig,
 ): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
+  if (config.apiKeyFile) {
+    // A pod mounts the key as a secret file; the host that launches the CLI never reads the value.
+    const text = (await $.fs.read(config.apiKeyFile)).trim();
+    if (text) return text;
+  }
   const fromEnv = await $.env.get('TYPESAFE_API_KEY');
   if (fromEnv) return fromEnv;
   const settings = await $.settings.read();
@@ -546,3 +556,6 @@ export const register: Register = (on: On, options: PluginOptions) => {
     return next(event);
   });
 };
+
+/** Test seam for the key resolution order (file, environment, settings). */
+export const getApiKeyForTest = getApiKey;

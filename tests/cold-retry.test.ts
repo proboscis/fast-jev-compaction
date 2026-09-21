@@ -112,3 +112,18 @@ describe('/compact fast-jev-if-cold', () => {
     expect(h.files.get('/state/journal.log')).toContain('compact(if-cold): cache cold (ttl-expired)');
   });
 });
+
+describe('apiKeyFile', () => {
+  it('reads the key from the configured file before the environment', async () => {
+    const { resolveHookConfig, getApiKeyForTest } = await import('../hooks/fast-jev.ts');
+    const config = resolveHookConfig({ apiKeyFile: '/run/secret/key' } as never);
+    expect(config.apiKeyFile).toBe('/run/secret/key');
+    const dollar = {
+      env: { get: async () => 'from-env' },
+      settings: { read: async () => ({}) },
+      fs: { read: async (p: string) => (p === '/run/secret/key' ? 'from-file\n' : '') },
+    };
+    expect(await getApiKeyForTest(dollar as never, config)).toBe('from-file');
+    expect(await getApiKeyForTest(dollar as never, resolveHookConfig({} as never))).toBe('from-env');
+  });
+});
