@@ -127,3 +127,23 @@ describe('apiKeyFile', () => {
     expect(await getApiKeyForTest(dollar as never, resolveHookConfig({} as never))).toBe('from-env');
   });
 });
+
+describe('cold pruning that removes too little', () => {
+  it('skips without asking the session for its fill (that call hangs in a headless session)', async () => {
+    const h = host(0);
+    const handlers = new Map<string, Handler>();
+    register(((name: string, h2: Handler) => void handlers.set(name, h2)) as never, {
+      stateDir: '/state', minColdTokens: 0, cacheTtlMinutes: 5,
+    } as never);
+    (h.dollar as { session: { usage: unknown } }).session.usage = () => new Promise(() => undefined); // never resolves
+    (h.dollar as { http?: unknown }).http = { fetch: async () => ({ status: 200, ok: true, text: '{}' }) };
+    (h.dollar as { settings?: unknown }).settings = { read: async () => ({ env: { TYPESAFE_API_KEY: 'k' } }) };
+    const next = (e: unknown) => e;
+    const outcome = await Promise.race([
+      handlers.get('session.compact')!(h.dollar, { trigger: 'manual', instructions: 'fast-jev-only', messages: [] }, next),
+      new Promise((resolve) => setTimeout(() => resolve('timed out'), 1500)),
+    ]);
+    expect(outcome).not.toBe('timed out');
+    expect((outcome as { skip?: string }).skip).toContain('too little');
+  });
+});

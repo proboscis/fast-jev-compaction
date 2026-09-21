@@ -489,7 +489,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
       });
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        const percent = await contextPercent($);
+        // A cold-cache pruning never falls back to the summary, so it must not ask the session
+        // for its fill: in a headless (-p) session that call did not answer and the engine's hook
+        // timeout ran the built-in summary instead (2026-09-22, 59 s, model call).
+        const percent = mine === 'cold' ? 0 : await contextPercent($);
         const outcome = lowReductionOutcome(event.trigger, mine, percent, config.fallbackAtPercent);
         if (outcome === 'skip') {
           if (mine === 'threshold') runtime.skippedAtPercent = percent;
