@@ -53,11 +53,15 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({
+      compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest',
+      coldCompaction: true, cacheTtlMinutes: 5, minColdTokens: 20000, fallbackAtPercent: 85, stateDir: '',
+    });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
       apiKey: 'k',
+      coldCompaction: true, cacheTtlMinutes: 5, minColdTokens: 20000, fallbackAtPercent: 85, stateDir: '',
       keepThreshold: 0.3,
       maxStateTokens: 1000,
       model: 'jev-x',

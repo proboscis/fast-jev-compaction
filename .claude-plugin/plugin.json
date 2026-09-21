@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -57,6 +57,36 @@
       "title": "Jev model",
       "description": "TypeSafe Jev model name.",
       "default": "jev-latest"
+    },
+    "coldCompaction": {
+      "type": "boolean",
+      "title": "Compact when the prompt cache will miss",
+      "description": "Before a model call that will miss the prompt cache anyway (new machine, another profile, another model, or a gap longer than cacheTtlMinutes), run one Jev compaction; skip silently when there is too little to remove.",
+      "default": true
+    },
+    "cacheTtlMinutes": {
+      "type": "number",
+      "title": "Prompt cache TTL (minutes)",
+      "description": "How long the prompt cache survives without use: 5 by default, 60 on accounts with the 1-hour cache.",
+      "default": 5
+    },
+    "fallbackAtPercent": {
+      "type": "number",
+      "title": "Fallback fill",
+      "description": "A threshold compaction that removes too little falls back to the built-in summary only at or above this context percentage; below it, nothing happens.",
+      "default": 85
+    },
+    "stateDir": {
+      "type": "string",
+      "title": "State directory",
+      "description": "Where the per-session cache state files live. Empty = $HOME/.cache/fast-jev-compaction.",
+      "default": ""
+    },
+    "minColdTokens": {
+      "type": "number",
+      "title": "Minimum history for a cold compaction",
+      "description": "Below this many estimated history tokens a cache-cold compaction is not worth a Jev request.",
+      "default": 20000
     }
   }
 }
