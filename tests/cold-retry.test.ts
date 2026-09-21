@@ -82,3 +82,33 @@ describe('a cold compaction the engine rejects at session.start', () => {
     expect(h.compactCalls()).toBe(1);
   });
 });
+
+describe('/compact fast-jev-if-cold', () => {
+  it('leaves a warm session untouched and prunes a cold one', async () => {
+    const { jevIfCold, jevOnly } = await import('../hooks/fast-jev.ts');
+    expect(jevIfCold('fast-jev-if-cold')).toBe(true);
+    expect(jevOnly('fast-jev-if-cold')).toBe(true);
+    expect(jevIfCold('fast-jev-only')).toBe(false);
+
+    const h = host(0);
+    const handlers = new Map<string, Handler>();
+    register(((name: string, h2: Handler) => void handlers.set(name, h2)) as never, {
+      stateDir: '/state', minColdTokens: 0, cacheTtlMinutes: 5,
+    } as never);
+    const compactEvent = { trigger: 'manual', instructions: 'fast-jev-if-cold', messages: [] };
+    let fellThrough = 0;
+    const next = (e: unknown) => { fellThrough += 1; return e; };
+    // warm: the state was written a moment ago by this profile and model
+    h.files.set(STATE, JSON.stringify({ at: Date.now(), configDir: '/h/.config/claude-a', model: 'claude-sonnet-5' }));
+    const warm = (await handlers.get('session.compact')!(h.dollar, compactEvent, next)) as { skip?: string };
+    expect(warm.skip).toContain('warm');
+    expect(fellThrough).toBe(0);
+    // cold: the state is older than the TTL
+    h.files.set(STATE, JSON.stringify({ at: Date.now() - 10 * 60_000, configDir: '/h/.config/claude-a', model: 'claude-sonnet-5' }));
+    const cold = (await handlers.get('session.compact')!(h.dollar, compactEvent, next)) as { skip?: string };
+    // nothing to prune in an empty transcript, but the verdict went the pruning way (no fallback to a summary)
+    expect(cold.skip).not.toContain('warm');
+    expect(fellThrough).toBe(0);
+    expect(h.files.get('/state/journal.log')).toContain('compact(if-cold): cache cold (ttl-expired)');
+  });
+});

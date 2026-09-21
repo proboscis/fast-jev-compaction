@@ -311,7 +311,16 @@ type CompactOf = { session: { compact: () => Promise<unknown> }; ui: { log: (t: 
 
 /** Whether a `/compact` prompt asked for Jev pruning only (no summary fallback). */
 export function jevOnly(instructions: string | undefined): boolean {
-  return /\bfast-jev-only\b/.test(instructions ?? '');
+  return /\bfast-jev-(only|if-cold)\b/.test(instructions ?? '');
+}
+
+/**
+ * Whether a `/compact` prompt asked to prune only if the prompt cache is cold
+ * (`/compact fast-jev-if-cold`): a launcher that resumes a session in a fresh
+ * process runs this first and lets the plugin's own state decide.
+ */
+export function jevIfCold(instructions: string | undefined): boolean {
+  return /\bfast-jev-if-cold\b/.test(instructions ?? '');
 }
 
 async function contextPercent($: SessionUsageOf): Promise<number> {
@@ -453,6 +462,15 @@ export const register: Register = (on: On, options: PluginOptions) => {
     // `/compact fast-jev-only` (a worker that knows the cache is cold): never fall back to the summary.
     const mine: CompactionOrigin = runtime.origin ?? (jevOnly(event.instructions) ? 'cold' : null);
     await journal($, runtime, `session.compact hook: trigger=${event.trigger} origin=${mine ?? 'none'} messages=${event.messages.length}`);
+    if (runtime.origin === null && jevIfCold(event.instructions)) {
+      // `/compact fast-jev-if-cold`: the same verdict the start-time check uses; warm = untouched.
+      const reason = coldReason(await readState($, runtime), await nowState($), runtime.config.cacheTtlMinutes * 60_000);
+      if (!reason) {
+        await journal($, runtime, 'compact(if-cold): cache warm; untouched');
+        return { skip: 'fast-jev-compaction: cache warm' };
+      }
+      await journal($, runtime, `compact(if-cold): cache cold (${reason}); pruning`);
+    }
     try {
       const config = { ...runtime.config, apiKey: await getApiKey($, runtime.config) };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
