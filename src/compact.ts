@@ -1,3 +1,4 @@
+import { countPruned, planMessagePrune, prunedChars } from './prune.js';
 import { noulAnswer } from './request.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
@@ -9,6 +10,7 @@ import type {
   JevAsker,
   JevQuestions,
   Message,
+  MessageDecision,
   ResolvedCompactOptions,
   ToolCall,
   ToolUse,
@@ -22,6 +24,9 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxRequestTokens: 30_000,
   truncateHeadChars: 300,
   maxRetainedTokens: 60_000,
+  dedupeRepeatedUserText: true,
+  dropSupersededSummaries: true,
+  resolvedIds: [],
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
@@ -54,6 +59,11 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       0,
       Math.floor(finite(options.maxRetainedTokens, DEFAULT_OPTIONS.maxRetainedTokens)),
     ),
+    dedupeRepeatedUserText:
+      options.dedupeRepeatedUserText ?? DEFAULT_OPTIONS.dedupeRepeatedUserText,
+    dropSupersededSummaries:
+      options.dropSupersededSummaries ?? DEFAULT_OPTIONS.dropSupersededSummaries,
+    resolvedIds: options.resolvedIds ?? DEFAULT_OPTIONS.resolvedIds,
   };
 }
 
@@ -147,7 +157,8 @@ function truncatedResultText(text: string, isError: boolean, headChars: number):
 
 /**
  * Rebuilds the conversation from the decisions. A dropped call disappears
- * together with its result; a dropped result keeps a bounded head and note.
+ * together with its result; a dropped result keeps a bounded head and note; a
+ * user body the rules removed (`messageDecisions`) becomes its one-line note.
  * Messages that lose all their content are removed; untouched messages are
  * returned as the same objects they came in as.
  */
@@ -156,6 +167,7 @@ export function applyDecisions(
   decisions: readonly CallDecision[],
   calls: readonly ToolCall[],
   headChars: number,
+  messageDecisions: readonly MessageDecision[] = [],
 ): Message[] {
   const byId = new Map(calls.map((call) => [call.id, call]));
   const actions = new Map<string, CallDecision['action']>();
@@ -163,12 +175,14 @@ export function applyDecisions(
     const call = byId.get(decision.id);
     if (call && decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
   }
+  const pruned = new Map(messageDecisions.map((decision) => [decision.index, decision]));
   const kept: Message[] = [];
-  for (const message of messages) {
+  for (const [index, message] of messages.entries()) {
+    const prune = pruned.get(index);
     const touched =
       message.toolUses.some((tool) => actions.has(tool.tool_use_id)) ||
       (message.toolResults ?? []).some((result) => actions.has(result.tool_use_id));
-    if (!touched) {
+    if (!touched && !prune) {
       kept.push(message);
       continue;
     }
@@ -204,7 +218,9 @@ export function applyDecisions(
               isError: result.isError,
             };
       });
+    const text = prune ? prune.note : message.text;
     if (
+      !prune &&
       !message.toolUses.some(
         (tool) => actions.get(tool.tool_use_id) === 'drop_call',
       ) &&
@@ -219,10 +235,10 @@ export function applyDecisions(
       kept.push(message);
       continue;
     }
-    if (message.text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
+    if (text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
       continue;
     }
-    const rebuilt: Message = { role: message.role, text: message.text, toolUses };
+    const rebuilt: Message = { role: message.role, text, toolUses };
     if (toolResults.length > 0) rebuilt.toolResults = toolResults;
     kept.push(rebuilt);
   }
@@ -329,10 +345,13 @@ export function trimToBudget(
   calls: readonly ToolCall[],
   headChars: number,
   maxRetainedTokens: number,
+  messageDecisions: readonly MessageDecision[] = [],
 ): { decisions: CallDecision[]; trimmed: number } {
   const out = decisions.map((decision) => ({ ...decision }));
   if (maxRetainedTokens <= 0) return { decisions: out, trimmed: 0 };
-  let estimate = retainedTokens(applyDecisions(messages, out, calls, headChars));
+  // The rules have already taken their bodies out, so the budget only has to
+  // find what is left over after them.
+  let estimate = retainedTokens(applyDecisions(messages, out, calls, headChars, messageDecisions));
   if (estimate <= maxRetainedTokens) return { decisions: out, trimmed: 0 };
 
   const byId = new Map(calls.map((call) => [call.id, call]));
@@ -393,6 +412,9 @@ export async function compact(
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
   const candidates = calls.filter((call) => !call.pinned);
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
+  // What rules can decide is decided before Jev is asked anything, and rides
+  // the same decision set: there is one place that rebuilds the history.
+  const messageDecisions = planMessagePrune(messages, resolved);
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
@@ -417,16 +439,19 @@ export async function compact(
     calls,
     resolved.truncateHeadChars,
     resolved.maxRetainedTokens,
+    messageDecisions,
   );
   const kept = applyDecisions(
     messages,
     decisions,
     calls,
     resolved.truncateHeadChars,
+    messageDecisions,
   );
   return {
     messages: kept,
     decisions,
+    messageDecisions,
     stats: {
       messagesBefore: messages.length,
       messagesAfter: kept.length,
@@ -440,6 +465,10 @@ export async function compact(
       retainedTokens: retainedTokens(kept),
       retainedTarget: resolved.maxRetainedTokens,
       budgetTrimmed: trimmed,
+      repeatedTexts: countPruned(messageDecisions, 'repeated_user_text'),
+      supersededSummaries: countPruned(messageDecisions, 'superseded_summary'),
+      resolvedDeliveries: countPruned(messageDecisions, 'resolved_ids'),
+      textCharsDropped: prunedChars(messageDecisions),
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,

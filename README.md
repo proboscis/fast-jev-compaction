@@ -12,7 +12,10 @@ lossy: a file path, exact error, constraint, or command can disappear even when
 it matters later. This library never rewrites anything. It only deletes tool
 calls and tool results Jev says are no longer needed, and it asks Jev while
 showing it the whole conversation. User and assistant text stays verbatim and
-in order.
+in order — except for three bodies that are dead weight by rule rather than by
+judgement (a body delivered twice, a superseded compaction summary, a delivery
+an external ledger says is answered); see
+[Three bodies Jev is never asked about](#three-bodies-jev-is-never-asked-about).
 
 The repository is both an npm package (`src/`) and a Claude Code plugin
 (`hooks/`, `.claude-plugin/`) that uses the package to replace Claude Code's
@@ -111,11 +114,16 @@ put it in a source file.
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
 | `maxRetainedTokens` | `60000` | Ceiling on the estimated tokens the compacted history may keep; `0` turns the budget off |
+| `dedupeRepeatedUserText` | `true` | Remove the older copies of a user body (≥200 chars) delivered again verbatim |
+| `dropSupersededSummaries` | `true` | Remove every compaction summary carried as a user message but the newest |
+| `resolvedIds` | none | Ids an external ledger answered; a delivery naming only answered ids is removed |
 
 `result.stats` reports message and character counts before and after, the
 per-reason decision counts, `retainedTokens` / `retainedTarget` / `budgetTrimmed`
-for the budget pass, the state size in estimated tokens, which fitting stage was
-needed, and the number of requests.
+for the budget pass, `repeatedTexts` / `supersededSummaries` /
+`resolvedDeliveries` / `textCharsDropped` for the three rules, the state size in
+estimated tokens, which fitting stage was needed, and the number of requests.
+`result.messageDecisions` lists the bodies the rules removed.
 
 ## Design: what a compaction costs, and the two limits that keep it worth it
 
@@ -151,6 +159,41 @@ or above `minReductionPercent`; below it a cache-cold pruning always skips
 hook timeout), a human or engine trigger falls back to the summary, and a
 plugin-initiated one falls back only at or above `fallbackAtPercent`.
 The retired `minReductionRatio` (0..1) is still read as an alias.
+
+### Three bodies Jev is never asked about
+
+Measured 2026-09-22 on a live history the plugin could no longer shrink: of the
+209k tokens it had to keep, **87% was user message bodies**, and one
+10,813-character bundle of deliveries sat in it **13 times with an identical
+body**. Jev is never asked about a body — the operator's rule is that a person's
+words are passed on as they were written — so none of this could ever go.
+
+Three of those bodies are dead weight by rule, not by judgement, so a rule takes
+them instead:
+
+1. **A body delivered again** (`dedupeRepeatedUserText`). The same text, trimmed
+   of surrounding whitespace, appearing more than once: the newest copy stays,
+   the older ones go. A repeat under 200 characters is left alone — a short turn
+   ("go ahead") is a real turn and removing it saves nothing.
+2. **A superseded compaction summary** (`dropSupersededSummaries`). The engine
+   delivers its summary as a user message beginning *"This session is being
+   continued from a previous conversation"*, so every earlier summary survives
+   each later compaction untouched. The newest one stays, the rest go.
+3. **An answered delivery** (`resolvedIds`, the plugin option
+   `resolvedIdsCommand`). A shell command prints one answered id per line; a body
+   that names ids — the sender of an `[agmsg from …]` header, or a ledger id like
+   `lt-…` / `ob-…` / `dav-…` — and names **only** answered ones is removed, so a
+   bundle still holding one unanswered letter stays whole. Off unless the command
+   is configured, and fail-open: no command, a non-zero exit, a timeout or empty
+   output all remove nothing and write one journal line.
+
+None of the three rewrites a body: the message keeps its place and its tool
+blocks, and its text becomes a one-line note saying what was removed and why.
+Pinned messages (the first, and the newest `preserveRecentMessages`) are never
+candidates, and the decisions are made **before** Jev is asked, on the same
+decision set `applyDecisions` and `trimToBudget` already use — there is one
+place that rebuilds the history, not two. Set any of them to `false` (or leave
+`resolvedIdsCommand` unset) to turn that rule off.
 
 ### Not done: pruning only the tail so the prefix survives
 
@@ -231,7 +274,10 @@ Two options set the economics (both overridable per profile from the
       "options": {
         "cacheTtlMinutes": 60,
         "maxRetainedTokens": 60000,
-        "minReductionPercent": 40
+        "minReductionPercent": 40,
+        "dedupeRepeatedUserText": true,
+        "dropSupersededSummaries": true,
+        "resolvedIdsCommand": ""
       }
     }
   }

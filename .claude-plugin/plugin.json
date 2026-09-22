@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -104,6 +104,30 @@
       "type": "string",
       "title": "TypeSafe API key file",
       "description": "Path of a file holding the TypeSafe API key (e.g. a mounted Kubernetes secret). Takes precedence over TYPESAFE_API_KEY."
+    },
+    "dedupeRepeatedUserText": {
+      "type": "boolean",
+      "title": "Remove repeated user bodies",
+      "description": "Remove the older copies of a user message body that was delivered again verbatim (200 chars or more), keeping the newest one. Measured 2026-09-22: one 10,813-character bundle of deliveries sat in a live history 13 times.",
+      "default": true
+    },
+    "dropSupersededSummaries": {
+      "type": "boolean",
+      "title": "Remove superseded compaction summaries",
+      "description": "Remove every compaction summary carried as a user message but the newest. A summary is delivered as a user message, so each earlier one otherwise survives every later compaction.",
+      "default": true
+    },
+    "resolvedIdsCommand": {
+      "type": "string",
+      "title": "Answered ids command",
+      "description": "Shell command printing one answered id per line. A delivery whose ids are all answered is removed. Unset, failing, or empty output removes nothing (fail-open).",
+      "default": ""
+    },
+    "resolvedIdsTimeoutMs": {
+      "type": "number",
+      "title": "Answered ids command timeout (ms)",
+      "description": "How long the answered-ids command may take before the compaction goes on without it.",
+      "default": 15000
     }
   }
 }

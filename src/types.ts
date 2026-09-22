@@ -56,6 +56,24 @@ export interface CallAnswer {
 
 export type CallAction = 'keep' | 'drop_result' | 'drop_call';
 
+/** Why a user message's body was removed without asking Jev. */
+export type MessagePruneReason = 'repeated_user_text' | 'superseded_summary' | 'resolved_ids';
+
+/**
+ * One user message whose body is removed by a rule, not by Jev. The message
+ * itself stays in place, its text replaced by `note`, so the turn structure and
+ * any tool blocks the message carries are untouched.
+ */
+export interface MessageDecision {
+  /** Index in the input transcript. */
+  index: number;
+  reason: MessagePruneReason;
+  /** Characters of user text the note replaces. */
+  chars: number;
+  /** The one-line note left in the body's place. */
+  note: string;
+}
+
 export interface CallDecision extends CallAnswer {
   id: string;
   tool: string;
@@ -112,6 +130,21 @@ export interface CompactOptions {
    * 0 (or negative) turns the budget off. Default 60000.
    */
   maxRetainedTokens?: number;
+  /**
+   * Remove the older copies of a user body that was delivered again verbatim,
+   * keeping the newest one. Default true.
+   */
+  dedupeRepeatedUserText?: boolean;
+  /**
+   * Remove every compaction summary carried as a user message but the newest.
+   * Default true.
+   */
+  dropSupersededSummaries?: boolean;
+  /**
+   * Ids an external ledger reports as answered. A user body that names ids and
+   * names only answered ones is removed. Default none.
+   */
+  resolvedIds?: readonly string[];
 }
 
 export interface ResolvedCompactOptions {
@@ -122,12 +155,17 @@ export interface ResolvedCompactOptions {
   maxRequestTokens: number;
   truncateHeadChars: number;
   maxRetainedTokens: number;
+  dedupeRepeatedUserText: boolean;
+  dropSupersededSummaries: boolean;
+  resolvedIds: readonly string[];
 }
 
 export interface CompactResult {
   /** The compacted transcript; untouched messages are the input objects. */
   messages: Message[];
   decisions: CallDecision[];
+  /** The user bodies removed by rule, before Jev was asked anything. */
+  messageDecisions: MessageDecision[];
   stats: {
     messagesBefore: number;
     messagesAfter: number;
@@ -144,6 +182,14 @@ export interface CompactResult {
     retainedTarget: number;
     /** Calls escalated by the budget pass after Jev had decided to keep them. */
     budgetTrimmed: number;
+    /** User bodies removed as a repeated delivery of an identical body. */
+    repeatedTexts: number;
+    /** Compaction summaries removed because a newer one is kept. */
+    supersededSummaries: number;
+    /** Deliveries removed because an external ledger answered every id they name. */
+    resolvedDeliveries: number;
+    /** Characters of user text the three rules removed. */
+    textCharsDropped: number;
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;

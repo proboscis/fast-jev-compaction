@@ -56,6 +56,10 @@ The plugin declares these `userConfig` values in
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
 | `model` | `jev-latest` |
+| `dedupeRepeatedUserText` | `true` |
+| `dropSupersededSummaries` | `true` |
+| `resolvedIdsCommand` | `""` |
+| `resolvedIdsTimeoutMs` | `15000` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
@@ -73,6 +77,16 @@ reduction, per-reason counts, state size and request count; a per-call
 `turn.complete` hook requests
 compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.
+
+Besides the tool calls Jev judges, three user bodies are removed by rule (see
+the root README): a body delivered again verbatim, a superseded compaction
+summary, and — only when `resolvedIdsCommand` is set — a delivery whose ids an
+external ledger reports as answered. The command runs through
+`$.process.run(["/bin/sh", "-c", …])` at compaction time with
+`resolvedIdsTimeoutMs`; a missing command, a non-zero exit, a timeout or empty
+output removes nothing and writes one journal line. Every compaction's journal
+line and toast carry the three counts
+(`text: N repeated, N old summaries, N answered (-N chars)`).
 
 ## Scope and caveat
 

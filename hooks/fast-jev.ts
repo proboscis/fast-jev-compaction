@@ -49,6 +49,10 @@ const HOOK_DEFAULTS = {
   fallbackAtPercent: 85,
   /** Directory of the per-session state files; empty = `$HOME/.cache/fast-jev-compaction`. */
   stateDir: '',
+  /** A shell command printing one answered id per line; empty = the rule is off. */
+  resolvedIdsCommand: '',
+  /** How long the resolved-ids command may take before the compaction goes on without it. */
+  resolvedIdsTimeoutMs: 15_000,
 };
 
 export type HookFetchInit = {
@@ -79,6 +83,9 @@ export type HookConfig = CompactOptions & {
   minColdTokens: number;
   fallbackAtPercent: number;
   stateDir: string;
+  /** Shell command printing the ids an external ledger answered, one per line. */
+  resolvedIdsCommand: string;
+  resolvedIdsTimeoutMs: number;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -130,7 +137,18 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     minColdTokens: optionNumber(options, 'minColdTokens', HOOK_DEFAULTS.minColdTokens),
     fallbackAtPercent: optionNumber(options, 'fallbackAtPercent', HOOK_DEFAULTS.fallbackAtPercent),
     stateDir: optionString(options, 'stateDir') ?? HOOK_DEFAULTS.stateDir,
+    resolvedIdsCommand:
+      optionString(options, 'resolvedIdsCommand') ?? HOOK_DEFAULTS.resolvedIdsCommand,
+    resolvedIdsTimeoutMs: optionNumber(
+      options,
+      'resolvedIdsTimeoutMs',
+      HOOK_DEFAULTS.resolvedIdsTimeoutMs,
+    ),
   };
+  for (const key of ['dedupeRepeatedUserText', 'dropSupersededSummaries'] as const) {
+    const value = options[key];
+    if (typeof value === 'boolean') config[key] = value;
+  }
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
   const apiKeyFile = optionString(options, 'apiKeyFile');
@@ -239,9 +257,11 @@ export function summarize(result: CompactResult): string {
   ].filter(Boolean);
   const budget =
     stats.budgetTrimmed > 0 ? `, ${stats.budgetTrimmed} over budget` : '';
+  // Always spelled out, so the journal shows the three rules ran even at zero.
+  const text = `text: ${stats.repeatedTexts} repeated, ${stats.supersededSummaries} old summaries, ${stats.resolvedDeliveries} answered (-${stats.textCharsDropped} chars)`;
   return `${percent0(reductionRatio(result))} reduction; retained=${stats.retainedTokens} target=${
     stats.retainedTarget
-  }${budget}; ${parts.join(', ') || 'no tool calls'}; state ~${stats.stateTokens} tokens (${
+  }${budget}; ${parts.join(', ') || 'no tool calls'}; ${text}; state ~${stats.stateTokens} tokens (${
     stats.stateStage
   }) in ${stats.requests} request(s)`;
 }
@@ -304,6 +324,55 @@ async function getApiKey(
     if (typeof value === 'string' && value) return value;
   }
   return undefined;
+}
+
+/** One answered id per line; blank lines and `#` comments are ignored. */
+export function parseResolvedIds(stdout: string): string[] {
+  const ids: string[] = [];
+  for (const line of stdout.split('\n')) {
+    const id = line.trim();
+    if (id.length > 0 && !id.startsWith('#') && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+type ProcessOf = {
+  process: {
+    run: (
+      argv: readonly string[],
+      init?: { timeoutMs?: number },
+    ) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  };
+};
+
+/**
+ * Asks the configured command which ids an external ledger has answered.
+ *
+ * Fail-open by construction: a missing command, a non-zero exit, a timeout or
+ * an empty answer all mean "no id is known to be answered", so the rule removes
+ * nothing and the compaction goes on. Every outcome writes one journal line.
+ */
+async function resolvedIdsFrom(
+  $: ProcessOf & EnvOf & FsOf & UiLogOf,
+  runtime: Runtime,
+): Promise<string[]> {
+  const command = runtime.config.resolvedIdsCommand;
+  if (!command) return [];
+  try {
+    const { exitCode, stdout, stderr } = await $.process.run(['/bin/sh', '-c', command], {
+      timeoutMs: runtime.config.resolvedIdsTimeoutMs,
+    });
+    if (exitCode !== 0) {
+      await journal($, runtime, `resolvedIdsCommand exited ${exitCode}; no ids (${stderr.trim().slice(0, 200)})`);
+      return [];
+    }
+    const ids = parseResolvedIds(stdout);
+    await journal($, runtime, `resolvedIdsCommand: ${ids.length} answered id(s)`);
+    return ids;
+  } catch (error) {
+    await journal($, runtime, `resolvedIdsCommand failed: ${error instanceof Error ? error.message : String(error)}; no ids`);
+    return [];
+  }
 }
 
 function notify(
@@ -501,7 +570,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
       await journal($, runtime, `compact(if-cold): cache cold (${reason}); pruning`);
     }
     try {
-      const config = { ...runtime.config, apiKey: await getApiKey($, runtime.config) };
+      const config = {
+        ...runtime.config,
+        apiKey: await getApiKey($, runtime.config),
+        resolvedIds: await resolvedIdsFrom($, runtime),
+      };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
