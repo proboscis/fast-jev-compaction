@@ -59,20 +59,42 @@ export function statePath(stateDir: string, sessionId: string): string {
 
 export type CompactionOrigin = 'cold' | 'threshold' | null;
 
+export type CompactionVerdict = 'apply' | 'skip' | 'fallback';
+
+export type OutcomeInput = {
+  /** The reduction Jev's pruning actually achieved, as a ratio of characters. */
+  reduction: number;
+  /** The engine's trigger: `plugin` when this plugin asked, else `manual` / `auto`. */
+  trigger: string;
+  /** Why this plugin asked, null when it did not. */
+  origin: CompactionOrigin;
+  /** Context fill in percent; 0 when it was not worth asking for. */
+  percent: number;
+  /** Below this ratio a pruning does not pay for the cache rewrite it causes. */
+  minReduction: number;
+  /** Fill at or above which the lossy summary is still better than nothing. */
+  fallbackAtPercent: number;
+};
+
 /**
- * What to do when Jev could not remove enough. The built-in summary is lossy,
- * so it is only worth it when a person or the engine asked (`manual` / `auto`)
- * or the window is nearly full; a plugin-initiated compaction otherwise skips.
+ * The one place that decides what a finished pruning becomes.
+ *
+ * A pruning is not free: the next request rewrites the whole retained prefix
+ * into the prompt cache. Measured 2026-09-22 over 22 real compactions, a
+ * pruning that removed 40% or more paid that rewrite back within 5–16
+ * responses, while one below 40% took 24–1214 — so below the minimum the
+ * cheapest thing to do is nothing at all.
+ *
+ * Order matters: a cold-cache pruning must never fall back, because the
+ * built-in summary is a model call and in a headless (-p) session it ran past
+ * the engine's hook timeout (measured 59 s, 2026-09-22). Only after that does a
+ * human/engine trigger, or a nearly full window, justify the lossy summary.
  */
-export function lowReductionOutcome(
-  trigger: string,
-  origin: CompactionOrigin,
-  percent: number,
-  fallbackAtPercent: number,
-): 'skip' | 'fallback' {
-  if (trigger !== 'plugin') return 'fallback';
-  if (origin === 'cold') return 'skip';
-  return percent >= fallbackAtPercent ? 'fallback' : 'skip';
+export function compactionOutcome(input: OutcomeInput): CompactionVerdict {
+  if (input.reduction >= input.minReduction) return 'apply';
+  if (input.origin === 'cold') return 'skip';
+  if (input.trigger !== 'plugin') return 'fallback';
+  return input.percent >= input.fallbackAtPercent ? 'fallback' : 'skip';
 }
 
 /**

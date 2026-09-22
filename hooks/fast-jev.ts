@@ -11,7 +11,7 @@ import type {
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import {
   coldReason,
-  lowReductionOutcome,
+  compactionOutcome,
   parseState,
   serializeState,
   statePath,
@@ -32,7 +32,12 @@ import type {
 
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
-  minReductionRatio: 0.25,
+  /**
+   * Below this reduction a pruning is not worth the cache rewrite it causes:
+   * measured 2026-09-22, the six compactions that removed 40% or more paid the
+   * rewrite back in 5–16 responses, the twelve below it took 24–1214.
+   */
+  minReductionPercent: 40,
   model: DEFAULT_MODEL,
   /** Compact when the next call will miss the prompt cache anyway. */
   coldCompaction: true,
@@ -66,7 +71,8 @@ export type HookConfig = CompactOptions & {
   /** A file holding the TypeSafe API key (a mounted secret); read at compaction time, never logged. */
   apiKeyFile?: string;
   compactAtPercent: number;
-  minReductionRatio: number;
+  /** Minimum reduction, in percent, for a pruning to be applied at all. */
+  minReductionPercent: number;
   model: string;
   coldCompaction: boolean;
   cacheTtlMinutes: number;
@@ -85,6 +91,18 @@ function optionString(options: PluginOptions, key: string): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/**
+ * The minimum reduction in percent. `minReductionRatio` (0..1) is the retired
+ * name kept so an existing settings.json keeps working; the percent wins.
+ */
+export function minReductionPercentOf(options: PluginOptions): number {
+  const percent = options['minReductionPercent'];
+  if (typeof percent === 'number' && Number.isFinite(percent)) return percent;
+  const ratio = options['minReductionRatio'];
+  if (typeof ratio === 'number' && Number.isFinite(ratio)) return ratio * 100;
+  return HOOK_DEFAULTS.minReductionPercent;
+}
+
 /** Reads the plugin's `userConfig` values; anything missing takes the defaults. */
 export function resolveHookConfig(options: PluginOptions): HookConfig {
   const numbers: Partial<Omit<CompactOptions, 'goal'>> = {};
@@ -94,6 +112,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'maxStateTokens',
     'maxRequestTokens',
     'truncateHeadChars',
+    'maxRetainedTokens',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -101,11 +120,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   const config: HookConfig = {
     ...numbers,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
-    minReductionRatio: optionNumber(
-      options,
-      'minReductionRatio',
-      HOOK_DEFAULTS.minReductionRatio,
-    ),
+    minReductionPercent: minReductionPercentOf(options),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
     coldCompaction:
       typeof options['coldCompaction'] === 'boolean'
@@ -222,9 +237,13 @@ export function summarize(result: CompactResult): string {
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
-  return `${percent0(reductionRatio(result))} reduction; ${
-    parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  const budget =
+    stats.budgetTrimmed > 0 ? `, ${stats.budgetTrimmed} over budget` : '';
+  return `${percent0(reductionRatio(result))} reduction; retained=${stats.retainedTokens} target=${
+    stats.retainedTarget
+  }${budget}; ${parts.join(', ') || 'no tool calls'}; state ~${stats.stateTokens} tokens (${
+    stats.stateStage
+  }) in ${stats.requests} request(s)`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -488,28 +507,39 @@ export const register: Register = (on: On, options: PluginOptions) => {
         return { status: response.status, ok: response.ok, text: response.text };
       });
       for (const line of decisionLogLines(result)) $.ui.log(line);
-      if (reductionRatio(result) < config.minReductionRatio) {
-        // A cold-cache pruning never falls back to the summary, so it must not ask the session
-        // for its fill: in a headless (-p) session that call did not answer and the engine's hook
-        // timeout ran the built-in summary instead (2026-09-22, 59 s, model call).
-        const percent = mine === 'cold' ? 0 : await contextPercent($);
-        const outcome = lowReductionOutcome(event.trigger, mine, percent, config.fallbackAtPercent);
-        if (outcome === 'skip') {
-          if (mine === 'threshold') runtime.skippedAtPercent = percent;
-          notify($, `skipped (below ${percent0(config.minReductionRatio)} minimum: ${summarize(result)})`);
-          await journal($, runtime, `compact(${event.trigger}${mine ? `/${mine}` : ''}): skipped, ${summarize(result)}`);
-          return { skip: 'fast-jev-compaction: too little to remove' };
-        }
+      const minReduction = config.minReductionPercent / 100;
+      // A cold-cache pruning never falls back to the summary, so it must not ask the session
+      // for its fill: in a headless (-p) session that call did not answer and the engine's hook
+      // timeout ran the built-in summary instead (2026-09-22, 59 s, model call).
+      const percent =
+        mine === 'cold' || reductionRatio(result) >= minReduction ? 0 : await contextPercent($);
+      const verdict = compactionOutcome({
+        reduction: reductionRatio(result),
+        trigger: event.trigger,
+        origin: mine,
+        percent,
+        minReduction,
+        fallbackAtPercent: config.fallbackAtPercent,
+      });
+      const where = `compact(${event.trigger}${mine ? `/${mine}` : ''})`;
+      if (verdict === 'skip') {
+        if (mine === 'threshold') runtime.skippedAtPercent = percent;
+        notify($, `skipped (below ${config.minReductionPercent}% minimum: ${summarize(result)})`);
+        await journal($, runtime, `${where}: skipped, ${summarize(result)}`);
+        return { skip: 'fast-jev-compaction: too little to remove' };
+      }
+      if (verdict === 'fallback') {
         notify(
           $,
-          `fallback to built-in summary (below ${percent0(config.minReductionRatio)} minimum: ${summarize(result)})`,
+          `fallback to built-in summary (below ${config.minReductionPercent}% minimum: ${summarize(result)})`,
         );
+        await journal($, runtime, `${where}: fallback to the built-in summary, ${summarize(result)}`);
         return next(event);
       }
       runtime.skippedAtPercent = null;
       const kept = `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`;
       notify($, kept);
-      await journal($, runtime, `compact(${event.trigger}${mine ? `/${mine}` : ''}): ${kept}`);
+      await journal($, runtime, `${where}: ${kept}`);
       return { messages };
     } catch (error) {
       await journal($, runtime, `compact(${event.trigger}${mine ? `/${mine}` : ''}): error ${error instanceof Error ? error.message : String(error)}`);

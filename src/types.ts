@@ -105,6 +105,13 @@ export interface CompactOptions {
   maxRequestTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /**
+   * Ceiling on the estimated tokens the compacted history may keep. Calls Jev
+   * decided to keep are escalated oldest-first until the history fits, so the
+   * retained size cannot ratchet upwards across successive compactions.
+   * 0 (or negative) turns the budget off. Default 60000.
+   */
+  maxRetainedTokens?: number;
 }
 
 export interface ResolvedCompactOptions {
@@ -114,6 +121,7 @@ export interface ResolvedCompactOptions {
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  maxRetainedTokens: number;
 }
 
 export interface CompactResult {
@@ -130,6 +138,12 @@ export interface CompactResult {
     resultsDropped: number;
     callsDropped: number;
     pinned: number;
+    /** Estimated tokens the compacted history holds. */
+    retainedTokens: number;
+    /** The ceiling that was applied, 0 when the budget was off. */
+    retainedTarget: number;
+    /** Calls escalated by the budget pass after Jev had decided to keep them. */
+    budgetTrimmed: number;
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;

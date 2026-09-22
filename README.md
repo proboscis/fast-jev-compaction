@@ -110,10 +110,68 @@ put it in a source file.
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
+| `maxRetainedTokens` | `60000` | Ceiling on the estimated tokens the compacted history may keep; `0` turns the budget off |
 
 `result.stats` reports message and character counts before and after, the
-per-reason decision counts, the state size in estimated tokens, which fitting
-stage was needed, and the number of requests.
+per-reason decision counts, `retainedTokens` / `retainedTarget` / `budgetTrimmed`
+for the budget pass, the state size in estimated tokens, which fitting stage was
+needed, and the number of requests.
+
+## Design: what a compaction costs, and the two limits that keep it worth it
+
+A pruning is not free. The request that follows one rewrites the whole retained
+prefix into the prompt cache, and a cache write is billed above a plain input
+token while a cache read is billed far below one. So the question is never "how
+many tokens did we remove" but "how many responses does it take to earn the
+rewrite back".
+
+A measurement of 22 real plugin compactions and 116 built-in ones (2026-09-22,
+two machines, transcripts of live sessions; the workings are in
+`experiments/agent-subtask-cost/out/billing/` of the operator's own tree) gave
+the numbers this design rests on:
+
+- The retained size **ratcheted upwards**: across one conversation's eight
+  compactions the kept history grew 57k → 167k tokens, the reduction fell
+  65% → 10%, and the cache rewrite the next request paid grew 177k → 500k.
+  Jev decides what is still needed and has no notion of a budget, and the plugin
+  only ever offered it the calls it had not seen before — so nothing already
+  kept was ever reconsidered. **`maxRetainedTokens` is the answer**: after Jev
+  has spoken, kept calls are escalated oldest-first until the history fits.
+- The compactions that removed **40% or more paid their rewrite back within
+  5–16 responses**; the ones below 40% took **24–1214** (one took 1214 because
+  it freed nothing at all and still rewrote 388k tokens). The built-in summary,
+  for contrast, cut per-response billing 82% and paid back in about 1 response.
+  **`minReductionPercent` is the answer**: below the minimum the plugin now does
+  nothing, which costs nothing.
+
+One decision point. `compactionOutcome` in `hooks/cold.ts` is the only place
+that turns a finished pruning into `apply` / `skip` / `fallback`. It applies at
+or above `minReductionPercent`; below it a cache-cold pruning always skips
+(the built-in summary is a model call, and under `-p` it ran past the engine's
+hook timeout), a human or engine trigger falls back to the summary, and a
+plugin-initiated one falls back only at or above `fallbackAtPercent`.
+The retired `minReductionRatio` (0..1) is still read as an alias.
+
+### Not done: pruning only the tail so the prefix survives
+
+A compaction that edits the middle of the history invalidates the prompt cache
+from the first edited token onwards — measured, the response after a pruning
+served only 5.6% of its input from cache and wrote the other 94.4%. Pruning only
+the *newest* tool results instead would leave the prefix byte-identical, so the
+cache would survive and the rewrite would cost nothing (the idea TokenPilot,
+arXiv 2606.17016, reports 56–87% savings for).
+
+Can this hook do it? **Yes mechanically, no usefully.** `session.compact`
+receives the whole message array and returns a replacement array, so returning
+"prefix unchanged, tail pruned" is a one-line change to the ordering in
+`trimToBudget`. But it does not pay here: the newest messages are the ones the
+assistant is still working from (they are pinned for that reason), and the tail
+beyond the pin is a handful of calls worth a few thousand tokens against a
+half-million-token prefix — a rounding error. The saving only exists if the
+prefix is large and stale, and that is exactly the part the tail-only rule
+refuses to touch. Worth revisiting only if the engine ever exposes which prefix
+the cache currently holds, so the plugin could cut at that boundary instead of
+guessing.
 
 ## Limitations
 
@@ -124,6 +182,9 @@ stage was needed, and the number of requests.
   result is safe to delete. The assistant can always re-run the tool.
 - The full state is repeated with every request, so a history near the state
   ceiling costs one request per handful of questions.
+- `maxRetainedTokens` cannot go below the pinned frame (the first message, the
+  newest `preserveRecentMessages`, and all message prose). A budget under that
+  floor escalates everything it may and stops there.
 
 ## Claude Code plugin
 
@@ -155,8 +216,27 @@ The install prompts for the plugin options (API key, thresholds, `truncateHeadCh
 Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
 auto-compaction) goes through Jev: the toast reads
 `fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history
-replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
-could not remove enough (short sessions, or when it fails).
+replaced the built-in summary, `skipped (below 40% minimum: …)` when the pruning
+would not have paid for the cache rewrite it causes, or
+`fallback to built-in summary (…)` when a person or the engine asked and Jev
+could not remove enough.
+
+Two options set the economics (both overridable per profile from the
+`pluginConfigs` of `settings.json`, like `cacheTtlMinutes`):
+
+```json
+{
+  "pluginConfigs": {
+    "fast-jev-compaction@fast-jev-compaction": {
+      "options": {
+        "cacheTtlMinutes": 60,
+        "maxRetainedTokens": 60000,
+        "minReductionPercent": 40
+      }
+    }
+  }
+}
+```
 
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is

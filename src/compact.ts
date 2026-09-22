@@ -21,6 +21,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
   truncateHeadChars: 300,
+  maxRetainedTokens: 60_000,
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
@@ -48,6 +49,10 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
     truncateHeadChars: Math.max(
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
+    ),
+    maxRetainedTokens: Math.max(
+      0,
+      Math.floor(finite(options.maxRetainedTokens, DEFAULT_OPTIONS.maxRetainedTokens)),
     ),
   };
 }
@@ -238,6 +243,128 @@ export function messageChars(message: Message): number {
   return total;
 }
 
+/** Estimated tokens of text, tool input and tool output a message holds. */
+export function messageTokens(message: Message): number {
+  let total = estimateTokens(message.text);
+  for (const tool of message.toolUses) {
+    let input = '';
+    try {
+      input = JSON.stringify(tool.input);
+    } catch {
+      input = '{}';
+    }
+    total += estimateTokens(input) + estimateTokens(tool.text ?? '');
+  }
+  for (const result of message.toolResults ?? []) total += estimateTokens(result.text);
+  return total;
+}
+
+/** Estimated tokens a whole transcript holds. */
+export function retainedTokens(messages: readonly Message[]): number {
+  return messages.reduce((sum, message) => sum + messageTokens(message), 0);
+}
+
+/**
+ * What one call costs the history now, and what it would cost after each
+ * further escalation. Measured over the places the call actually appears (the
+ * tool_use block, a separate tool_result block, or both), so the budget pass
+ * needs no rebuild per step.
+ */
+type CallCost = { now: number; afterDropResult: number; afterDropCall: number };
+
+function callCosts(
+  messages: readonly Message[],
+  headChars: number,
+): Map<string, CallCost> {
+  const costs = new Map<string, CallCost>();
+  const add = (id: string, now: number, afterDropResult: number): void => {
+    const prior = costs.get(id) ?? { now: 0, afterDropResult: 0, afterDropCall: 0 };
+    prior.now += now;
+    prior.afterDropResult += afterDropResult;
+    costs.set(id, prior);
+  };
+  for (const message of messages) {
+    for (const tool of message.toolUses) {
+      let input = '{}';
+      try {
+        input = JSON.stringify(tool.input);
+      } catch {
+        input = '{}';
+      }
+      const body = tool.text ?? '';
+      const inputTokens = estimateTokens(input);
+      add(
+        tool.tool_use_id,
+        inputTokens + estimateTokens(body),
+        inputTokens + estimateTokens(truncatedResultText(body, tool.isError ?? false, headChars)),
+      );
+    }
+    for (const result of message.toolResults ?? []) {
+      add(
+        result.tool_use_id,
+        estimateTokens(result.text),
+        estimateTokens(truncatedResultText(result.text, result.isError ?? false, headChars)),
+      );
+    }
+  }
+  return costs;
+}
+
+/**
+ * Holds the compacted history under `maxRetainedTokens`.
+ *
+ * Jev decides what is still needed, but it has no notion of a budget: in a long
+ * conversation it keeps a little more every time, so the retained size ratchets
+ * upwards (measured 2026-09-22 on one conversation: 57k -> 167k tokens over
+ * eight compactions, the reduction falling 65% -> 10% while the cache rewrite
+ * the next request pays grew 177k -> 500k tokens). This pass escalates the kept
+ * calls oldest-first — first dropping their results, then the calls themselves —
+ * until the estimate fits. Pinned calls (the first message and the newest
+ * `preserveRecentMessages`) are never touched and prose is never rewritten, so
+ * the floor is the pinned frame plus the conversation's own text.
+ */
+export function trimToBudget(
+  messages: readonly Message[],
+  decisions: readonly CallDecision[],
+  calls: readonly ToolCall[],
+  headChars: number,
+  maxRetainedTokens: number,
+): { decisions: CallDecision[]; trimmed: number } {
+  const out = decisions.map((decision) => ({ ...decision }));
+  if (maxRetainedTokens <= 0) return { decisions: out, trimmed: 0 };
+  let estimate = retainedTokens(applyDecisions(messages, out, calls, headChars));
+  if (estimate <= maxRetainedTokens) return { decisions: out, trimmed: 0 };
+
+  const byId = new Map(calls.map((call) => [call.id, call]));
+  const costs = callCosts(messages, headChars);
+  const escalatable = out
+    .filter((decision) => decision.reason !== 'pinned')
+    .sort((a, b) => (byId.get(a.id)?.callIndex ?? 0) - (byId.get(b.id)?.callIndex ?? 0));
+
+  let trimmed = 0;
+  // Two ladders, oldest first: take the bodies of kept results, then the calls themselves.
+  for (const stage of ['keep', 'drop_result'] as const) {
+    for (const decision of escalatable) {
+      if (estimate <= maxRetainedTokens) break;
+      if (decision.action !== stage) continue;
+      const cost = costs.get(byId.get(decision.id)?.tool_use_id ?? '');
+      if (!cost) continue;
+      if (stage === 'keep') {
+        estimate -= Math.max(0, cost.now - cost.afterDropResult);
+        decision.action = 'drop_result';
+        decision.reason = 'result_dropped';
+      } else {
+        estimate -= Math.max(0, cost.afterDropResult - cost.afterDropCall);
+        decision.action = 'drop_call';
+        decision.reason = 'call_dropped';
+      }
+      trimmed += 1;
+    }
+    if (estimate <= maxRetainedTokens) break;
+  }
+  return { decisions: out, trimmed };
+}
+
 export function reductionRatio(result: Pick<CompactResult, 'stats'>): number {
   const { charsBefore, charsAfter } = result.stats;
   return charsBefore === 0 ? 0 : (charsBefore - charsAfter) / charsBefore;
@@ -251,8 +378,10 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
  * Compacts a transcript by asking Jev, for every tool call outside the pinned
  * first and newest messages, whether the call and whether its result must
  * stay. The whole history (results omitted, fitted into `maxStateTokens`) is
- * sent as state with every batch of questions. Throws when Jev fails or the
- * history cannot be fitted; the caller decides whether to fall back.
+ * sent as state with every batch of questions. Whatever Jev keeps is then held
+ * under `maxRetainedTokens` by `trimToBudget`, so successive compactions of one
+ * conversation cannot ratchet the retained size upwards. Throws when Jev fails
+ * or the history cannot be fitted; the caller decides whether to fall back.
  */
 export async function compact(
   messages: readonly Message[],
@@ -278,8 +407,16 @@ export async function compact(
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
 
-  const decisions = calls.map((call) =>
+  const judged = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
+  );
+  // Jev says what is still needed; the budget says how much of it fits.
+  const { decisions, trimmed } = trimToBudget(
+    messages,
+    judged,
+    calls,
+    resolved.truncateHeadChars,
+    resolved.maxRetainedTokens,
   );
   const kept = applyDecisions(
     messages,
@@ -300,6 +437,9 @@ export async function compact(
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
       pinned: count(decisions, 'pinned'),
+      retainedTokens: retainedTokens(kept),
+      retainedTarget: resolved.maxRetainedTokens,
+      budgetTrimmed: trimmed,
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,

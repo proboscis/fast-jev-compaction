@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { jevOnly } from '../hooks/fast-jev.ts';
 import {
   coldReason,
-  lowReductionOutcome,
+  compactionOutcome,
   parseState,
   serializeState,
   statePath,
@@ -51,17 +51,48 @@ describe('state file', () => {
   });
 });
 
-describe('lowReductionOutcome', () => {
+describe('compactionOutcome', () => {
+  const at = (over: Partial<Parameters<typeof compactionOutcome>[0]>) =>
+    compactionOutcome({
+      reduction: 0.1,
+      trigger: 'plugin',
+      origin: 'threshold',
+      percent: 0,
+      minReduction: 0.4,
+      fallbackAtPercent: 85,
+      ...over,
+    });
+
+  it('applies a pruning that reached the minimum, whoever asked', () => {
+    expect(at({ reduction: 0.4 })).toBe('apply');
+    expect(at({ reduction: 0.9, trigger: 'manual', origin: null })).toBe('apply');
+    expect(at({ reduction: 0.58, origin: 'cold', trigger: 'manual' })).toBe('apply');
+  });
+
+  it('does nothing below the minimum, where the cache rewrite is not paid back', () => {
+    // Measured 2026-09-22: below 40% the rewrite took 24-1214 responses to recover.
+    expect(at({ reduction: 0.39 })).toBe('skip');
+    expect(at({ reduction: 0.3, percent: 70 })).toBe('skip');
+  });
+
+  it('never summarizes for a cache-cold pruning, whatever the trigger says', () => {
+    expect(at({ reduction: 0.1, origin: 'cold', percent: 99 })).toBe('skip');
+    expect(at({ reduction: 0.1, origin: 'cold', trigger: 'manual', percent: 99 })).toBe('skip');
+  });
+
   it('keeps the built-in summary for manual and auto compactions', () => {
-    expect(lowReductionOutcome('manual', null, 10, 85)).toBe('fallback');
-    expect(lowReductionOutcome('auto', null, 95, 85)).toBe('fallback');
+    expect(at({ reduction: 0.1, trigger: 'manual', origin: null, percent: 10 })).toBe('fallback');
+    expect(at({ reduction: 0.1, trigger: 'auto', origin: null, percent: 95 })).toBe('fallback');
   });
-  it('never summarizes for a cache-cold compaction', () => {
-    expect(lowReductionOutcome('plugin', 'cold', 99, 85)).toBe('skip');
+
+  it('summarizes a threshold compaction only when the window is nearly full', () => {
+    expect(at({ reduction: 0.1, percent: 70 })).toBe('skip');
+    expect(at({ reduction: 0.1, percent: 85 })).toBe('fallback');
   });
-  it('summarizes for a threshold compaction only when the window is nearly full', () => {
-    expect(lowReductionOutcome('plugin', 'threshold', 70, 85)).toBe('skip');
-    expect(lowReductionOutcome('plugin', 'threshold', 85, 85)).toBe('fallback');
+
+  it('honours a raised minimum: the old 25% now only skips', () => {
+    expect(at({ reduction: 0.3, minReduction: 0.25 })).toBe('apply');
+    expect(at({ reduction: 0.3, minReduction: 0.4 })).toBe('skip');
   });
 });
 

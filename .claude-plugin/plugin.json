@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.4.6",
+  "version": "0.5.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -28,11 +28,23 @@
       "description": "Context percentage at which turn.complete requests compaction.",
       "default": 60
     },
+    "minReductionPercent": {
+      "type": "number",
+      "title": "Minimum reduction (percent)",
+      "description": "Below this reduction the pruning is not applied at all: the next request would rewrite the retained prefix into the prompt cache for almost no saving. Measured 2026-09-22 over 22 real compactions: 40% or more paid the rewrite back within 5-16 responses, below it 24-1214.",
+      "default": 40
+    },
     "minReductionRatio": {
       "type": "number",
-      "title": "Minimum reduction ratio",
-      "description": "Minimum estimated character reduction required to replace history.",
+      "title": "Minimum reduction ratio (retired)",
+      "description": "Retired name of minReductionPercent, as a 0..1 ratio. Kept so an existing settings.json keeps working; minReductionPercent wins when both are set.",
       "default": 0.25
+    },
+    "maxRetainedTokens": {
+      "type": "number",
+      "title": "Maximum retained tokens",
+      "description": "Ceiling on the estimated tokens the compacted history may keep. Calls Jev decided to keep are escalated oldest-first (result dropped, then the call) until the history fits, so the retained size cannot ratchet upwards across successive compactions. 0 turns the budget off.",
+      "default": 60000
     },
     "maxStateTokens": {
       "type": "number",
